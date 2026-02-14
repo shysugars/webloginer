@@ -6,7 +6,6 @@ import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.IBinder;
 import android.util.Log;
-import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.TextView;
@@ -18,7 +17,6 @@ import com.google.android.material.card.MaterialCardView;
 import com.google.android.material.materialswitch.MaterialSwitch;
 
 import rikka.shizuku.Shizuku;
-import rikka.shizuku.Shizuku.UserServiceArgs;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -39,21 +37,25 @@ public class MainActivity extends AppCompatActivity {
     private IUserService userService;
     private boolean isServiceBound = false;
 
+    // ===== Shizuku 监听器 =====
+
     private final Shizuku.OnRequestPermissionResultListener permissionResultListener =
             (requestCode, grantResult) -> {
                 if (requestCode == SHIZUKU_PERMISSION_REQUEST_CODE) {
                     if (grantResult == PackageManager.PERMISSION_GRANTED) {
-                        updateShizukuStatus("Shizuku 权限已授予");
-                        bindUserService();
+                        runOnUiThread(() -> {
+                            updateShizukuStatus("Shizuku 权限已授予");
+                            bindUserService();
+                        });
                     } else {
-                        updateShizukuStatus("Shizuku 权限被拒绝");
+                        runOnUiThread(() -> updateShizukuStatus("Shizuku 权限被拒绝"));
                     }
                 }
             };
 
     private final Shizuku.OnBinderReceivedListener binderReceivedListener = () -> {
         Log.d(TAG, "Shizuku binder received");
-        runOnUiThread(() -> checkAndRequestPermission());
+        runOnUiThread(this::checkAndRequestPermission);
     };
 
     private final Shizuku.OnBinderDeadListener binderDeadListener = () -> {
@@ -65,30 +67,45 @@ public class MainActivity extends AppCompatActivity {
         });
     };
 
-    private final ServiceConnection serviceConnection = new ServiceConnection();
+    // ===== 关键修复：使用 Shizuku.UserServiceArgs 的正确回调方式 =====
 
-    private class ServiceConnection implements Shizuku.UserServiceArgs.Callback,
-            android.content.ServiceConnection {
+    private final Shizuku.UserServiceArgs userServiceArgs = new Shizuku.UserServiceArgs(
+            new ComponentName(
+                    "com.example.helloworld",
+                    UserService.class.getName()
+            ))
+            .daemon(true)
+            .processNameSuffix("user_service")
+            .debuggable(true)
+            .version(1);
 
-        @Override
-        public void onServiceConnected(ComponentName name, IBinder service) {
-            Log.d(TAG, "UserService connected");
-            userService = IUserService.Stub.asInterface(service);
-            isServiceBound = true;
-            runOnUiThread(() -> {
-                updateShizukuStatus("UserService 已连接");
-                connectWebSocket();
-            });
-        }
+    /**
+     * 使用 android.content.ServiceConnection 接口
+     * Shizuku.bindUserService 接受的就是标准的 ServiceConnection
+     */
+    private final android.content.ServiceConnection serviceConnection =
+            new android.content.ServiceConnection() {
+                @Override
+                public void onServiceConnected(ComponentName name, IBinder service) {
+                    Log.d(TAG, "UserService connected");
+                    userService = IUserService.Stub.asInterface(service);
+                    isServiceBound = true;
+                    runOnUiThread(() -> {
+                        updateShizukuStatus("UserService 已连接");
+                        connectWebSocket();
+                    });
+                }
 
-        @Override
-        public void onServiceDisconnected(ComponentName name) {
-            Log.d(TAG, "UserService disconnected");
-            userService = null;
-            isServiceBound = false;
-            runOnUiThread(() -> updateShizukuStatus("UserService 已断开"));
-        }
-    }
+                @Override
+                public void onServiceDisconnected(ComponentName name) {
+                    Log.d(TAG, "UserService disconnected");
+                    userService = null;
+                    isServiceBound = false;
+                    runOnUiThread(() -> updateShizukuStatus("UserService 已断开"));
+                }
+            };
+
+    // ===== Activity 生命周期 =====
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -169,20 +186,22 @@ public class MainActivity extends AppCompatActivity {
                     updateStatus("执行失败: " + e.getMessage());
                 }
             } else {
-                updateStatus("UserService 未连接");
+                updateStatus("UserService 未连接，无法执行");
             }
         });
     }
 
+    // ===== Shizuku 权限与绑定 =====
+
     private void checkAndRequestPermission() {
         try {
             if (!Shizuku.pingBinder()) {
-                updateShizukuStatus("Shizuku 未运行");
+                updateShizukuStatus("Shizuku 未运行，请先启动 Shizuku");
                 return;
             }
 
             if (Shizuku.isPreV11()) {
-                updateShizukuStatus("Shizuku 版本过低");
+                updateShizukuStatus("Shizuku 版本过低，请升级");
                 return;
             }
 
@@ -190,40 +209,34 @@ public class MainActivity extends AppCompatActivity {
                 updateShizukuStatus("Shizuku 权限已授予");
                 bindUserService();
             } else if (Shizuku.shouldShowRequestPermissionRationale()) {
-                updateShizukuStatus("Shizuku 权限已被永久拒绝");
+                updateShizukuStatus("Shizuku 权限已被永久拒绝，请在 Shizuku 中手动授权");
             } else {
                 Shizuku.requestPermission(SHIZUKU_PERMISSION_REQUEST_CODE);
                 updateShizukuStatus("正在请求 Shizuku 权限...");
             }
         } catch (Exception e) {
-            Log.e(TAG, "Error checking Shizuku permission", e);
+            Log.e(TAG, "Error checking Shizuku", e);
             updateShizukuStatus("Shizuku 检查失败: " + e.getMessage());
         }
     }
 
     private void bindUserService() {
         if (isServiceBound) {
-            Log.d(TAG, "Service already bound");
+            Log.d(TAG, "Service already bound, connecting WS directly");
+            connectWebSocket();
             return;
         }
 
         try {
-            Shizuku.bindUserService(
-                    new UserServiceArgs(new ComponentName(
-                            getPackageName(),
-                            UserService.class.getName()))
-                            .daemon(true)
-                            .processNameSuffix("user_service")
-                            .debuggable(BuildConfig.DEBUG)
-                            .version(BuildConfig.VERSION_CODE),
-                    serviceConnection
-            );
+            Shizuku.bindUserService(userServiceArgs, serviceConnection);
             updateShizukuStatus("正在绑定 UserService...");
         } catch (Exception e) {
             Log.e(TAG, "Error binding user service", e);
             updateShizukuStatus("绑定 UserService 失败: " + e.getMessage());
         }
     }
+
+    // ===== WebSocket 连接 =====
 
     private void connectWebSocket() {
         String url = etServerUrl.getText().toString().trim();
@@ -242,22 +255,26 @@ public class MainActivity extends AppCompatActivity {
 
         try {
             userService.connect(url, key, packages);
-            updateStatus("WebSocket 正在连接...");
+            updateStatus("WebSocket 正在连接到 " + url);
         } catch (Exception e) {
             Log.e(TAG, "Error connecting WebSocket", e);
             updateStatus("连接失败: " + e.getMessage());
         }
     }
 
+    // ===== UI 更新 =====
+
     private void updateStatus(String status) {
-        tvStatus.setText(status);
+        tvStatus.setText("WebSocket: " + status);
         Log.d(TAG, "Status: " + status);
     }
 
     private void updateShizukuStatus(String status) {
-        tvShizukuStatus.setText(status);
+        tvShizukuStatus.setText("Shizuku: " + status);
         Log.d(TAG, "Shizuku Status: " + status);
     }
+
+    // ===== 清理 =====
 
     @Override
     protected void onDestroy() {
@@ -265,6 +282,6 @@ public class MainActivity extends AppCompatActivity {
         Shizuku.removeRequestPermissionResultListener(permissionResultListener);
         Shizuku.removeBinderReceivedListener(binderReceivedListener);
         Shizuku.removeBinderDeadListener(binderDeadListener);
-        // 不断开 UserService，让它在后台保持运行
+        // 注意：不解绑 UserService，让 daemon 模式保持后台运行
     }
 }
